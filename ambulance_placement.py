@@ -21,6 +21,7 @@ Required packages:
 
 import os
 import sys
+import concurrent.futures
 import math
 import warnings
 import numpy as np
@@ -60,8 +61,11 @@ except ImportError:
 # =========================================================================
 # CONFIGURATION
 # =========================================================================
+from dotenv import load_dotenv
+load_dotenv()
+
 # Google Maps Distance Matrix API key (set env var or edit here)
-MAP_API_KEY = os.environ.get("GOOGLE_MAPS_API_KEY", "Your APi Key Here")
+MAP_API_KEY = os.environ.get("GOOGLE_MAPS_API_KEY")
 
 # Coverage threshold in minutes
 COVERAGE_THRESHOLD_MINUTES = 15
@@ -361,30 +365,53 @@ def travel_time_haversine(lat1, lon1, lat2, lon2, speed=FALLBACK_SPEED_KMH):
     return haversine_km(lat1, lon1, lat2, lon2) * 1.4 / speed * 60
 
 
+def _fetch_matrix_chunk(i0, j0, origins_chunk, dests_chunk, key):
+    o_str = "|".join(f"{la},{lo}" for la, lo in origins_chunk)
+    d_str = "|".join(f"{la},{lo}" for la, lo in dests_chunk)
+    url = (f"https://maps.googleapis.com/maps/api/distancematrix/json"
+           f"?origins={o_str}&destinations={d_str}&key={key}&mode=driving")
+    try:
+        data = req_lib.get(url, timeout=30).json()
+        if data['status'] != 'OK':
+            return False, f"API Error: {data.get('error_message', data['status'])}"
+        
+        chunk_data = []
+        for row in data['rows']:
+            row_data = []
+            for el in row['elements']:
+                val = (el['duration']['value'] / 60) if el['status'] == 'OK' else float('inf')
+                row_data.append(val)
+            chunk_data.append(row_data)
+        return True, (i0, j0, chunk_data)
+    except Exception as e:
+        return False, f"API request failed: {e}"
+
 def _api_travel_matrix(origins, dests, key):
-    """Query Google Maps Distance Matrix API. Returns matrix (minutes) or None."""
+    """Query Google Maps Distance Matrix API concurrently. Returns matrix (minutes) or None."""
     if not REQUESTS_AVAILABLE:
         return None
     mat = np.zeros((len(origins), len(dests)))
-    BS = 25
-    for i0 in range(0, len(origins), BS):
-        o_str = "|".join(f"{la},{lo}" for la, lo in origins[i0:i0 + BS])
-        for j0 in range(0, len(dests), BS):
-            d_str = "|".join(f"{la},{lo}" for la, lo in dests[j0:j0 + BS])
-            url = (f"https://maps.googleapis.com/maps/api/distancematrix/json"
-                   f"?origins={o_str}&destinations={d_str}&key={key}&mode=driving")
-            try:
-                data = req_lib.get(url, timeout=30).json()
-                if data['status'] != 'OK':
-                    print(f"    API Error: {data.get('error_message', data['status'])}")
-                    return None
-                for i, row in enumerate(data['rows']):
-                    for j, el in enumerate(row['elements']):
-                        mat[i0 + i][j0 + j] = (el['duration']['value'] / 60
-                                                if el['status'] == 'OK' else float('inf'))
-            except Exception as e:
-                print(f"    API request failed: {e}")
+    BS = 10  # Maximum elements per request is 100 (BS * BS <= 100)
+    
+    tasks = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        for i0 in range(0, len(origins), BS):
+            o_chunk = origins[i0:i0 + BS]
+            for j0 in range(0, len(dests), BS):
+                d_chunk = dests[j0:j0 + BS]
+                tasks.append(executor.submit(_fetch_matrix_chunk, i0, j0, o_chunk, d_chunk, key))
+                
+        for future in concurrent.futures.as_completed(tasks):
+            success, result = future.result()
+            if not success:
+                print(f"    {result}")
                 return None
+            
+            i0, j0, chunk_data = result
+            for i, row_data in enumerate(chunk_data):
+                for j, val in enumerate(row_data):
+                    mat[i0 + i][j0 + j] = val
+
     return mat
 
 

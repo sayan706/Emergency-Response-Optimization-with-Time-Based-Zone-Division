@@ -68,9 +68,9 @@ except ImportError:
     pass
 
 # Google Maps Distance Matrix API key (set env var or edit here)
-MAP_API_KEY = os.environ.get("GOOGLE_MAPS_API_KEY", "AIzaSyBLkK2TU_wmKk-cIhLKsiKVd2Qe_cnBIjg")
+MAP_API_KEY = os.environ.get("GOOGLE_MAPS_API_KEY")
 # TomTom API Key (fallback)
-TOMTOM_API_KEY = os.environ.get("TOMTOM_API_KEY", "BHyiRkYeg52YC5WLBFNClJnbRF7PBdoX")
+TOMTOM_API_KEY = os.environ.get("TOMTOM_API_KEY")
 
 # Coverage threshold in minutes
 COVERAGE_THRESHOLD_MINUTES = 15

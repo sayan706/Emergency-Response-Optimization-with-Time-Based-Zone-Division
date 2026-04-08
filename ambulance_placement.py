@@ -61,11 +61,16 @@ except ImportError:
 # =========================================================================
 # CONFIGURATION
 # =========================================================================
-from dotenv import load_dotenv
-load_dotenv()
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 # Google Maps Distance Matrix API key (set env var or edit here)
-MAP_API_KEY = os.environ.get("GOOGLE_MAPS_API_KEY")
+MAP_API_KEY = os.environ.get("GOOGLE_MAPS_API_KEY", "AIzaSyBLkK2TU_wmKk-cIhLKsiKVd2Qe_cnBIjg")
+# TomTom API Key (fallback)
+TOMTOM_API_KEY = os.environ.get("TOMTOM_API_KEY", "BHyiRkYeg52YC5WLBFNClJnbRF7PBdoX")
 
 # Coverage threshold in minutes
 COVERAGE_THRESHOLD_MINUTES = 15
@@ -386,20 +391,93 @@ def _fetch_matrix_chunk(i0, j0, origins_chunk, dests_chunk, key):
     except Exception as e:
         return False, f"API request failed: {e}"
 
-def _api_travel_matrix(origins, dests, key):
-    """Query Google Maps Distance Matrix API concurrently. Returns matrix (minutes) or None."""
+def _fetch_tomtom_matrix_chunk(i0, j0, origins_chunk, dests_chunk, key, retries=3):
+    import time
+    
+    url = f"https://api.tomtom.com/routing/matrix/2?key={key}"
+    headers = {
+        'Content-Type': 'application/json'
+    }
+    
+    origins_payload = [{"point": {"latitude": la, "longitude": lo}} for la, lo in origins_chunk]
+    dests_payload = [{"point": {"latitude": la, "longitude": lo}} for la, lo in dests_chunk]
+    
+    payload = {
+        "origins": origins_payload,
+        "destinations": dests_payload
+    }
+    
+    for attempt in range(retries):
+        try:
+            # Stay inside TomTom's 5 Transactions Per Second (cells/sec) free limit
+            time.sleep(1.1)
+            resp = req_lib.post(url, json=payload, headers=headers, timeout=30)
+            data = resp.json()
+            
+            if resp.status_code == 429 or 'error' in data or 'detailedError' in data:
+                err_msg = str(data.get('detailedError', data.get('error', resp.status_code)))
+
+                # If this error trips specifically on OVER_TRANSACTION_LIMIT even after math controls,
+                # it definitively means the DAILY 2,500 transaction cap is exceeded (not just QPS).
+                if "OVER_TRANSACTION_LIMIT" in err_msg or "FORBIDDEN" in err_msg:
+                    return False, f"TomTom API Daily Quota Exceeded."
+                
+                if attempt < retries - 1:
+                    print(f"    [TomTom] Rate limit warning. Retrying {attempt+1}/{retries} in 5s...")
+                    time.sleep(5)
+                    continue
+                return False, f"TomTom API Error: {err_msg}"
+            
+            # TomTom v2 returns a list inside 'data'
+            matrix_data = data.get('data', [])
+            if not matrix_data:
+                return False, "TomTom API returned no matrix data."
+                
+            # Initialize with inf
+            chunk_data = [[float('inf')] * len(dests_chunk) for _ in range(len(origins_chunk))]
+            
+            for item in matrix_data:
+                o_idx = item.get('originIndex')
+                d_idx = item.get('destinationIndex')
+                
+                # Verify indices are within bounds just in case
+                if o_idx is not None and d_idx is not None and o_idx < len(origins_chunk) and d_idx < len(dests_chunk):
+                    summary = item.get('routeSummary')
+                    if summary and 'travelTimeInSeconds' in summary:
+                        chunk_data[o_idx][d_idx] = summary['travelTimeInSeconds'] / 60.0
+                        
+            return True, (i0, j0, chunk_data)
+        except Exception as e:
+            if attempt < retries - 1:
+                time.sleep(3)
+                continue
+            return False, f"TomTom API request failed: {e}"
+            
+    return False, "TomTom API failed after max retries."
+
+
+def _api_travel_matrix(origins, dests, key, api_type='google'):
+    """Query Distance Matrix API concurrently. Returns matrix (minutes) or None."""
     if not REQUESTS_AVAILABLE:
         return None
     mat = np.zeros((len(origins), len(dests)))
-    BS = 10  # Maximum elements per request is 100 (BS * BS <= 100)
+    
+    # Google comfortably handles large block requests (BS=10 -> 100 cells)
+    # TomTom Freemium charges 1 Transaction per cell. It permits max 5 TPS. 
+    # Therefore max TomTom Matrix dimension is 2x2 (4 cells per sec) to avoid OVER_TRANSACTION_LIMIT.
+    BS = 10 if api_type == 'google' else 2
     
     tasks = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+    workers = 10 if api_type == 'google' else 1
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
         for i0 in range(0, len(origins), BS):
             o_chunk = origins[i0:i0 + BS]
             for j0 in range(0, len(dests), BS):
                 d_chunk = dests[j0:j0 + BS]
-                tasks.append(executor.submit(_fetch_matrix_chunk, i0, j0, o_chunk, d_chunk, key))
+                if api_type == 'google':
+                    tasks.append(executor.submit(_fetch_matrix_chunk, i0, j0, o_chunk, d_chunk, key))
+                else:
+                    tasks.append(executor.submit(_fetch_tomtom_matrix_chunk, i0, j0, o_chunk, d_chunk, key))
                 
         for future in concurrent.futures.as_completed(tasks):
             success, result = future.result()
@@ -417,14 +495,25 @@ def _api_travel_matrix(origins, dests, key):
 
 def build_travel_matrix(candidates, demands):
     """Build travel-time matrix (candidates × demands). Returns (matrix, method_name)."""
-    use_api = (MAP_API_KEY not in ("YOUR_API_KEY_HERE", "") and REQUESTS_AVAILABLE)
-    if use_api:
+    # 1. Try Google Maps API
+    use_google = (MAP_API_KEY not in ("YOUR_API_KEY_HERE", "") and REQUESTS_AVAILABLE)
+    if use_google:
         print("    Using Google Maps Distance Matrix API …")
-        m = _api_travel_matrix(candidates, demands, MAP_API_KEY)
+        m = _api_travel_matrix(candidates, demands, MAP_API_KEY, 'google')
         if m is not None:
             return m, "Google Maps API"
-        print("    API failed → Haversine fallback")
+        print("    Google API failed → Trying TomTom API fallback")
 
+    # 2. Try TomTom API
+    use_tomtom = (TOMTOM_API_KEY not in ("", None) and REQUESTS_AVAILABLE)
+    if use_tomtom:
+        print("    Using TomTom Matrix Routing API …")
+        m = _api_travel_matrix(candidates, demands, TOMTOM_API_KEY, 'tomtom')
+        if m is not None:
+            return m, "TomTom API"
+        print("    TomTom API failed → Haversine fallback")
+
+    # 3. Fallback to Haversine
     print(f"    Using Haversine estimation ({FALLBACK_SPEED_KMH} km/h) …")
     mat = np.zeros((len(candidates), len(demands)))
     for i, (cla, clo) in enumerate(candidates):
@@ -621,32 +710,63 @@ def generate_map(all_results, out_path):
     for period, res in all_results.items():
         fg = folium.FeatureGroup(name=f"{period} ({TIME_RANGES[period]})",
                                  show=(period == 'Morning'))
-        # demand points
-        for p in res['bpts']:
-            folium.CircleMarker(
-                [p['LATITUDE'], p['LONGITUDE']], radius=5,
-                color=zcol.get(p['ZONE'], 'gray'), fill=True, fill_opacity=0.7,
-                popup=f"{p['ZONE']} C{int(p['CLUSTER'])} {p['DIRECTION']}",
-                tooltip=f"{p['ZONE']}-{p['DIRECTION']}"
-            ).add_to(fg)
-        # ambulances
+        
+        # 1. DRAW ZONES (POLYGONS) SO OVERLAPS ARE VERY CLEAR
+        # Draw Green -> Orange -> Red so Red is on top visually
+        for z_color in ['Green', 'Orange', 'Red']:
+            subset = res['zs'][res['zs']['ZONE'] == z_color]
+            for _, row in subset.iterrows():
+                cluster_id = row['CLUSTER']
+                c_bpts = [p for p in res['bpts'] if p['CLUSTER'] == cluster_id]
+                dir_map = {p['DIRECTION']: (p['LATITUDE'], p['LONGITUDE']) for p in c_bpts}
+                # cyclic order for polygon
+                cyclic_dirs = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW']
+                poly_points = [dir_map[d] for d in cyclic_dirs if d in dir_map]
+                if poly_points:
+                    folium.Polygon(
+                        locations=poly_points,
+                        color=zcol.get(z_color, 'gray'),
+                        weight=2,
+                        fill=True,
+                        fill_color=zcol.get(z_color, 'gray'),
+                        fill_opacity=0.3,
+                        tooltip=f"Zone {z_color} (Cluster {int(cluster_id)})"
+                    ).add_to(fg)
+
+        # 2. demand points (boundary points), ordered Green -> Orange -> Red
+        for z_color in ['Green', 'Orange', 'Red']:
+            for p in [x for x in res['bpts'] if x['ZONE'] == z_color]:
+                folium.CircleMarker(
+                    [p['LATITUDE'], p['LONGITUDE']], radius=5,
+                    color=zcol.get(p['ZONE'], 'gray'), fill=True, fill_opacity=0.7,
+                    popup=f"{p['ZONE']} C{int(p['CLUSTER'])} {p['DIRECTION']}",
+                    tooltip=f"{p['ZONE']}-{p['DIRECTION']}"
+                ).add_to(fg)
+
+        # 3. cluster centres, offset so Red markers sit above Green
+        for z_color in ['Green', 'Orange', 'Red']:
+            for _, row in res['zs'][res['zs']['ZONE'] == z_color].iterrows():
+                z_offset = {'Red': 1000, 'Orange': 500, 'Green': 0}.get(z_color, 0)
+                folium.Marker(
+                    [row['CENTER_LATITUDE'], row['CENTER_LONGITUDE']],
+                    tooltip=f"C{int(row['CLUSTER'])} {row['ZONE']}",
+                    icon=folium.Icon(color=zcol.get(row['ZONE'], 'gray'),
+                                     icon='warning-sign', prefix='glyphicon'),
+                    z_index_offset=z_offset
+                ).add_to(fg)
+
+        # 4. ambulances
         for idx, loc in enumerate(res['lscp']['selected_locations']):
             folium.Marker(
                 [loc[0], loc[1]],
                 popup=f"🚑 #{idx+1} {res['lscp']['selected_labels'][idx]}",
                 tooltip=f"🚑 #{idx+1}",
-                icon=folium.Icon(color='blue', icon='plus-sign', prefix='glyphicon')
+                icon=folium.Icon(color='blue', icon='plus-sign', prefix='glyphicon'),
+                z_index_offset=2000
             ).add_to(fg)
             folium.Circle([loc[0], loc[1]], radius=5360, color='blue',
                           fill=False, opacity=0.25).add_to(fg)
-        # cluster centres
-        for _, row in res['zs'].iterrows():
-            folium.Marker(
-                [row['CENTER_LATITUDE'], row['CENTER_LONGITUDE']],
-                tooltip=f"C{int(row['CLUSTER'])} {row['ZONE']}",
-                icon=folium.Icon(color=zcol.get(row['ZONE'], 'gray'),
-                                 icon='warning-sign', prefix='glyphicon')
-            ).add_to(fg)
+            
         fg.add_to(m)
 
     folium.LayerControl(collapsed=False).add_to(m)

@@ -63,12 +63,11 @@ except ImportError:
 # CONFIGURATION & CONSTANTS
 # ═══════════════════════════════════════════════════════════════════════
 
-# Gemini model fallback chain — tries each in order until one works
+# Gemini model fallback chain — prioritized for speed and quota limits (Flash models only)
 GEMINI_MODELS = [
-    "gemini-2.5-pro",
-    "gemini-2.5-flash",
-    "gemini-2.0-pro-exp-02-05", # Fallback to 2.0 version
-    "gemini-2.0-flash",
+    "gemini-3-flash-preview",  # Top preference (State-of-the-art Flash)
+    "gemini-2.5-flash",        # Strong fallback
+    "gemini-2.0-flash",        # Reliable backup
 ]
 
 # Risk-level thresholds (probability %)
@@ -635,8 +634,16 @@ def get_ai_reasoning_from_gemini(prompt: str) -> Optional[str]:
             elapsed = time.time() - t0
             print(f"  ✅ Response from {model} in {elapsed:.1f}s")
 
-            if response.text:
-                return response.text.strip()
+            # Handle multi-part responses (e.g., those with 'thought_signature') 
+            # to avoid SDK warnings when using response.text
+            final_text = ""
+            if response.candidates and response.candidates[0].content.parts:
+                for part in response.candidates[0].content.parts:
+                    if hasattr(part, "text") and part.text:
+                        final_text += part.text
+            
+            if final_text.strip():
+                return final_text.strip()
             return None
 
         except errors.APIError as e:
@@ -644,19 +651,19 @@ def get_ai_reasoning_from_gemini(prompt: str) -> Optional[str]:
                  print(f"  ❌ Authentication failed for {model} - {e}")
                  return None
             if e.code == 404:
-                 print(f"  ⚠ Model {model} not available — trying next …")
+                 print(f"  ⚠ Model {model} unknown or deprecated — trying next …")
                  continue
             if e.code == 429:
-                 print(f"  ❌ Rate limit reached on {model} — trying next …")
+                 print(f"  ❌ Quota exceeded for {model} (Free Tier limit) — trying next …")
                  continue
              
             print(f"  ❌ API error on {model} (status {e.code}): {e.message}")
             continue
         except Exception as e:
-            print(f"  ❌ Unexpected error: {e}")
-            return None
+            print(f"  ❌ Unexpected error on {model}: {e}")
+            continue
 
-    print("  ❌ All models failed — using baseline fallback.")
+    print("  ❌ All models failed or unavailable (likely Quota/API limits).")
     return None
 
 

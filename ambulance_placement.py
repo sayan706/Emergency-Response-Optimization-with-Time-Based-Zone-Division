@@ -69,8 +69,6 @@ except ImportError:
 
 # Google Maps Distance Matrix API key (set env var or edit here)
 MAP_API_KEY = os.environ.get("GOOGLE_MAPS_API_KEY")
-# TomTom API Key (fallback)
-TOMTOM_API_KEY = os.environ.get("TOMTOM_API_KEY")
 
 # Coverage threshold in minutes
 COVERAGE_THRESHOLD_MINUTES = 15
@@ -391,93 +389,24 @@ def _fetch_matrix_chunk(i0, j0, origins_chunk, dests_chunk, key):
     except Exception as e:
         return False, f"API request failed: {e}"
 
-def _fetch_tomtom_matrix_chunk(i0, j0, origins_chunk, dests_chunk, key, retries=3):
-    import time
-    
-    url = f"https://api.tomtom.com/routing/matrix/2?key={key}"
-    headers = {
-        'Content-Type': 'application/json'
-    }
-    
-    origins_payload = [{"point": {"latitude": la, "longitude": lo}} for la, lo in origins_chunk]
-    dests_payload = [{"point": {"latitude": la, "longitude": lo}} for la, lo in dests_chunk]
-    
-    payload = {
-        "origins": origins_payload,
-        "destinations": dests_payload
-    }
-    
-    for attempt in range(retries):
-        try:
-            # Stay inside TomTom's 5 Transactions Per Second (cells/sec) free limit
-            time.sleep(1.1)
-            resp = req_lib.post(url, json=payload, headers=headers, timeout=30)
-            data = resp.json()
-            
-            if resp.status_code == 429 or 'error' in data or 'detailedError' in data:
-                err_msg = str(data.get('detailedError', data.get('error', resp.status_code)))
 
-                # If this error trips specifically on OVER_TRANSACTION_LIMIT even after math controls,
-                # it definitively means the DAILY 2,500 transaction cap is exceeded (not just QPS).
-                if "OVER_TRANSACTION_LIMIT" in err_msg or "FORBIDDEN" in err_msg:
-                    return False, f"TomTom API Daily Quota Exceeded."
-                
-                if attempt < retries - 1:
-                    print(f"    [TomTom] Rate limit warning. Retrying {attempt+1}/{retries} in 5s...")
-                    time.sleep(5)
-                    continue
-                return False, f"TomTom API Error: {err_msg}"
-            
-            # TomTom v2 returns a list inside 'data'
-            matrix_data = data.get('data', [])
-            if not matrix_data:
-                return False, "TomTom API returned no matrix data."
-                
-            # Initialize with inf
-            chunk_data = [[float('inf')] * len(dests_chunk) for _ in range(len(origins_chunk))]
-            
-            for item in matrix_data:
-                o_idx = item.get('originIndex')
-                d_idx = item.get('destinationIndex')
-                
-                # Verify indices are within bounds just in case
-                if o_idx is not None and d_idx is not None and o_idx < len(origins_chunk) and d_idx < len(dests_chunk):
-                    summary = item.get('routeSummary')
-                    if summary and 'travelTimeInSeconds' in summary:
-                        chunk_data[o_idx][d_idx] = summary['travelTimeInSeconds'] / 60.0
-                        
-            return True, (i0, j0, chunk_data)
-        except Exception as e:
-            if attempt < retries - 1:
-                time.sleep(3)
-                continue
-            return False, f"TomTom API request failed: {e}"
-            
-    return False, "TomTom API failed after max retries."
-
-
-def _api_travel_matrix(origins, dests, key, api_type='google'):
+def _api_travel_matrix(origins, dests, key):
     """Query Distance Matrix API concurrently. Returns matrix (minutes) or None."""
     if not REQUESTS_AVAILABLE:
         return None
     mat = np.zeros((len(origins), len(dests)))
     
     # Google comfortably handles large block requests (BS=10 -> 100 cells)
-    # TomTom Freemium charges 1 Transaction per cell. It permits max 5 TPS. 
-    # Therefore max TomTom Matrix dimension is 2x2 (4 cells per sec) to avoid OVER_TRANSACTION_LIMIT.
-    BS = 10 if api_type == 'google' else 2
+    BS = 10
     
     tasks = []
-    workers = 10 if api_type == 'google' else 1
+    workers = 10
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
         for i0 in range(0, len(origins), BS):
             o_chunk = origins[i0:i0 + BS]
             for j0 in range(0, len(dests), BS):
                 d_chunk = dests[j0:j0 + BS]
-                if api_type == 'google':
-                    tasks.append(executor.submit(_fetch_matrix_chunk, i0, j0, o_chunk, d_chunk, key))
-                else:
-                    tasks.append(executor.submit(_fetch_tomtom_matrix_chunk, i0, j0, o_chunk, d_chunk, key))
+                tasks.append(executor.submit(_fetch_matrix_chunk, i0, j0, o_chunk, d_chunk, key))
                 
         for future in concurrent.futures.as_completed(tasks):
             success, result = future.result()
@@ -499,21 +428,12 @@ def build_travel_matrix(candidates, demands):
     use_google = (MAP_API_KEY not in ("YOUR_API_KEY_HERE", "") and REQUESTS_AVAILABLE)
     if use_google:
         print("    Using Google Maps Distance Matrix API …")
-        m = _api_travel_matrix(candidates, demands, MAP_API_KEY, 'google')
+        m = _api_travel_matrix(candidates, demands, MAP_API_KEY)
         if m is not None:
             return m, "Google Maps API"
-        print("    Google API failed → Trying TomTom API fallback")
+        print("    Google API failed → Haversine fallback")
 
-    # 2. Try TomTom API
-    use_tomtom = (TOMTOM_API_KEY not in ("", None) and REQUESTS_AVAILABLE)
-    if use_tomtom:
-        print("    Using TomTom Matrix Routing API …")
-        m = _api_travel_matrix(candidates, demands, TOMTOM_API_KEY, 'tomtom')
-        if m is not None:
-            return m, "TomTom API"
-        print("    TomTom API failed → Haversine fallback")
-
-    # 3. Fallback to Haversine
+    # 2. Fallback to Haversine
     print(f"    Using Haversine estimation ({FALLBACK_SPEED_KMH} km/h) …")
     mat = np.zeros((len(candidates), len(demands)))
     for i, (cla, clo) in enumerate(candidates):

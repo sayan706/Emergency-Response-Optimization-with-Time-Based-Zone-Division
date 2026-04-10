@@ -335,13 +335,6 @@ def collect_user_input() -> Dict[str, Any]:
     data["night_event"] = (data["is_festival_day"]
                            and data["time_of_day"] in ("night", "late night"))
 
-    # ── Emergency (optional — 1 input) ──────────────────────────────
-    _section("EMERGENCY CONTEXT (optional)")
-    data["ambulance_response_time_min"] = _prompt_optional_float(
-        "Estimated ambulance response time (min)")
-    data["hospital_distance_km"] = None
-    data["emergency_support"]    = "available"
-
     return data
 
 
